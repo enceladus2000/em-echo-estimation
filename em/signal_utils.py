@@ -10,15 +10,17 @@ def gen_frac_delay_kernel(delay, flen, window):
     3. Kernel actually delays by delay + (flen - 1)/2, so account for that!
 
     Args:
-        delay (float): Recommended in [-0.5, 0.5], for filter symmetry.
+        delay (float): Should be in [-0.5, 0.5], for filter symmetry.
         flen (int): Length of filter, recommended odd integer for symmetry. Higher the better.
         window (str): Type of window to apply to sinc function. Choose among 'hann', 'hamming', 'blackman', 'bartlett', or None (for no windowing).
 
     Returns
     """
+    assert flen % 2 == 1, 'Filter length should be odd integer'
+    assert -0.5 <= delay <= 0.5, 'Delay should be in [-0.5, 0.5]'
     n = np.arange(flen)
     h = np.sinc(n - flen//2 - delay)
-    # TODO: shouldn't windows be applied to sinc function before delay? 
+    # TODO: 0.5 delay is not symmetric, why?
     if window == 'blackman':
         h *= np.blackman(flen)
     elif window in ('hann', 'hanning'):
@@ -33,8 +35,26 @@ def gen_frac_delay_kernel(delay, flen, window):
     return h
 
 def delay_signal(signal, delay, flen, window='blackman'):
-    kernel = gen_frac_delay_kernel(delay, flen, window)
-    return np.convolve(signal, kernel, mode='same') # TODO: shouldn't i be using full mode?
+    """Delays signal by real-valued delay using fractional delay filter. Note that the signal is delay by the actual delay, not delay + flen//2. Thus, delay must be greater than flen//2.
+
+    Args:
+        signal (np.ndarray): Signal to be delayed.
+        delay (float): Real-valued delay. Must be greater than flen//2.
+        flen (int): Length of fractional delay filter. Should be odd integer.
+        window (str, optional): Kind of window. Defaults to 'blackman'.
+
+    Returns:
+        np.ndarray: Delayed signal of same length with actual delay.
+    """
+    assert delay >= 0, 'Delay should be non-negative'
+    assert delay >= flen//2, 'Delay should be greater than half filter length'
+
+    intdly = int(np.round(delay))
+    fracdly = delay - intdly
+    dlysignal = np.zeros(len(signal))
+    dlysignal[intdly:] = signal[:len(signal)-intdly]
+    kernel = gen_frac_delay_kernel(fracdly, flen, window)
+    return np.convolve(dlysignal, kernel, mode='same')
 
 # REFACTOR: amps first, delays next
 def gen_ir(irlen, delays, amps, fdflen=41, fdfwin='blackman'):
