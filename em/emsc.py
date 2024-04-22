@@ -4,7 +4,7 @@ import sys, os, copy
 from dataclasses import dataclass
 from scipy.optimize import minimize_scalar
 
-from em.signal_utils import gen_ir, delay_signal
+from em.sim_utils import gen_ir, delay_signal
 from typing import Tuple
 
 @dataclass
