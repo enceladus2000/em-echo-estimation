@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 import copy
 from dataclasses import dataclass
 from scipy.signal import correlate as sp_correlate
-
+from scipy.optimize import minimize, OptimizeResult, Bounds
 from em.signal_utils import delay_signal
 from typing import Tuple, Union
 
@@ -21,9 +21,11 @@ class EMMC_Setup:
 
 	max_iter: int = 100
 	return_history: bool = False
+
 	Mstep_maximizer: str = 'gridsearch'
-	# Mstep_maxiter: int = 30
-	# Mstep_xatol: float = 1e-3
+	Mstep_maxiter: int = 40
+	Mstep_toa_atol: float = 1e-3
+	
 	fdflen: int = 41    		# length of fractional delay filter
 	fdfwindow: str = 'blackman' # window for fractional delay filter
 
@@ -80,7 +82,6 @@ class EMMC_Estimate:
 	def __repr__(self) -> str:
 		return self.__str__()
 
-
 def EMMC(src_signal, mic_signals, setup: EMMC_Setup, init_est: EMMC_Estimate):
 	assert src_signal.shape[0] == mic_signals.shape[1], 'Source and microphone signals must have same length'
 
@@ -99,6 +100,20 @@ def EMMC(src_signal, mic_signals, setup: EMMC_Setup, init_est: EMMC_Estimate):
 	else:
 		return est_iter
 
+# TODO: items in return_history don't necessarily need to be EMMC_estimate, best to have separate class... how to have class with optional/variable/on-the-fly attributes?
+# TODO: type hints on shape and dtype of numpy arrays?
+"""TODO: functional-program the shit out of this
+- EMMC_iter as an actual generator
+- EMMC_iter can be two fucking lines lmao (but idk, need to check about parallel computation-ing it)
+- explicit cost function method and grid in Mstep_r
+
+grid = J(toa, doa) for toa in toa_grid for doa in doa_grid # numpy way of doing this?
+grid -> debug!
+est = gridsearch(grid)
+OR
+est = optimizer(J(toa, doa) for ...)
+
+"""
 def EMMC_iter(src_signal, mic_signals, setup: EMMC_Setup, cur_est: EMMC_Estimate) -> EMMC_Estimate:
 	xmrs = Estep(src_signal, mic_signals, setup, cur_est) 		# (M, R, N)
 
@@ -108,7 +123,6 @@ def EMMC_iter(src_signal, mic_signals, setup: EMMC_Setup, cur_est: EMMC_Estimate
 		new_est.set_rth_reflection(r, toa, phi, gain, setup)
 
 	return new_est
-
 
 def Mstep_r(xmr, src_signal, setup: EMMC_Setup, r: int):
 	"""Returns TOA, DOA (phi) and gain (g) estimate from M step for single reflection (r). 
@@ -121,31 +135,77 @@ def Mstep_r(xmr, src_signal, setup: EMMC_Setup, r: int):
 	Returns:
 		(float, float, float): TOA, DOA, gain
 	"""
+	# TODO: rename gridsearch to something else?
 	if setup.Mstep_maximizer == 'gridsearch':
-		cost_func = np.zeros((len(setup.toa_grid), len(setup.phi_grid)))
-		for pidx, phicand in enumerate(setup.phi_grid):
-			tdoacand = compute_tdoas(phicand, setup)
+		return M_gridsearch(xmr, src_signal, setup, r)
+	elif setup.Mstep_maximizer == 'nelder-mead':
+		# obtain rough gridsearch toa and phi estimate
+		# not worried about anything but the first (toa, phi) candidate, maybe can do later.
+		grid_toa, grid_phi = M_gridsearch(xmr, src_signal, setup, r, calc_gain=False)
 
+		def M_costfunc(x):
+			toa, phi = x
+			tdoas = compute_tdoas(phi, setup)
 			Dxmsum = np.zeros(len(src_signal))
 			for m in range(setup.num_mics):
-				Dxmsum += delay_signal(xmr[m, r], -tdoacand[m], setup.fdflen, setup.fdfwindow)
+				Dxmsum += delay_signal(xmr[m, r], -tdoas[m], setup.fdflen, setup.fdfwindow)
+			return -np.dot(Dxmsum, delay_signal(src_signal, toa, setup.fdflen, setup.fdfwindow))
+		
+		delta_phi = setup.phi_range[2]
+		res: OptimizeResult = minimize(
+			M_costfunc,
+			(grid_toa, grid_phi),
+			method='nelder-mead',
+			options={
+				'maxiter': setup.Mstep_maxiter,
+				'xatol': setup.Mstep_toa_atol,
+				# 'bounds': Bounds(lb=(grid_toa-1, grid_phi-delta_phi), ub=(grid_toa+1, grid_phi+delta_phi))
+			}
+		)
+		if res.success:
+			M_min = res.fun
+			maxtoa, maxphi = res.x
+			print(f'Took {res.nit} iterations to minimize for r={r}')
+		else:
+			print(f'Minimization failed for r={r}, msg: {res.message}')
+		
+			M_min = M_costfunc((grid_toa, grid_phi))
+			maxtoa, maxphi = grid_toa, grid_phi
+		maxgain = -M_min / np.dot(src_signal, src_signal) / setup.num_mics
+		return maxtoa, maxphi, maxgain
 
-			# for tidx, toacand in enumerate(setup.toa_grid):
-			# 	shiftedsrcsig = delay_signal(src_signal, toacand, setup.fdflen, setup.fdfwindow)
-			# 	cost_func[tidx, pidx] = np.dot(Dxmsum, shiftedsrcsig)
-			nmin = setup.toa_range[0] + len(src_signal) - 1
-			nmax = setup.toa_range[1] + len(src_signal) - 1
-			cost_func[:, pidx] = np.correlate(Dxmsum, src_signal, mode='full')[nmin:nmax]
-			# cost_func[:, pidx] = sp_correlate(Dxmsum, src_signal, mode='full')[nmin:nmax]
 
-		toa_idx, phi_idx = np.unravel_index(np.argmax(cost_func), cost_func.shape)
-		newtoa = setup.toa_grid[toa_idx]
-		newphi = setup.phi_grid[phi_idx]
-		newgain = cost_func[toa_idx, phi_idx] / np.dot(src_signal, src_signal) / setup.num_mics
+
 	else:
 		raise NotImplementedError(f'Mstep_maximizer={setup.Mstep_maximizer} not implemented')
-	
-	return newtoa, newphi, newgain
+
+
+def M_gridsearch(xmr, src_signal, setup: EMMC_Setup, r: int, calc_gain=True):
+	cost_func = np.zeros((len(setup.toa_grid), len(setup.phi_grid)))
+	for pidx, phicand in enumerate(setup.phi_grid):
+		tdoacand = compute_tdoas(phicand, setup)
+
+		Dxmsum = np.zeros(len(src_signal))
+		for m in range(setup.num_mics):
+			Dxmsum += delay_signal(xmr[m, r], -tdoacand[m], setup.fdflen, setup.fdfwindow)
+
+		# for tidx, toacand in enumerate(setup.toa_grid):
+		# 	shiftedsrcsig = delay_signal(src_signal, toacand, setup.fdflen, setup.fdfwindow)
+		# 	cost_func[tidx, pidx] = np.dot(Dxmsum, shiftedsrcsig)
+		nmin = setup.toa_range[0] + len(src_signal) - 1
+		nmax = setup.toa_range[1] + len(src_signal) - 1
+		cost_func[:, pidx] = np.correlate(Dxmsum, src_signal, mode='full')[nmin:nmax]
+		# cost_func[:, pidx] = sp_correlate(Dxmsum, src_signal, mode='full')[nmin:nmax]
+
+	toa_idx, phi_idx = np.unravel_index(np.argmax(cost_func), cost_func.shape)
+	newtoa = setup.toa_grid[toa_idx]
+	newphi = setup.phi_grid[phi_idx]
+	# TODO: memoize src_signal^2 somehow
+	if calc_gain:
+		newgain = cost_func[toa_idx, phi_idx] / np.dot(src_signal, src_signal) / setup.num_mics
+		return newtoa, newphi, newgain
+	else:
+		return newtoa, newphi
 
 def Estep(src_signal, mic_signals, setup: EMMC_Setup, cur_est: EMMC_Estimate):
 	xmrs = np.empty((setup.num_mics, setup.num_ref, len(src_signal))) # (M, R, N)
