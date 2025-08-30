@@ -6,30 +6,29 @@ from scipy.signal import correlate as sp_correlate
 from scipy.optimize import minimize, OptimizeResult, Bounds
 from em.signal_utils import delay_signal
 from typing import Tuple, Union, Generator
-
+from collections import namedtuple
 
 @dataclass
 class EMMC_Setup:
     num_ref: int  # number of reflections
     num_mics: int  # number of microphones
-    mic_array_radius: (
-        float  # in 'sampling wavelengths', i.e. wavelength of sound with frequency = fs
-    )
+    mic_array_radius: float 
+    # radius is in 'sampling wavelengths', i.e. wavelength of sound with frequency = fs
     # i.e. in natural units, 343 / fs meters
     # i.e. mic_array_radius = mic_array_radius_metres * fs / 343
+
     toa_range: Tuple[int, int]
-    phi_range: Union[Tuple[int, int], Tuple[int, int, int]] = (
-        None  # (start, stop) or (start, stop, step), in radians
-    )
+    phi_range: Tuple[int, int, int] = None # (start, stop) or (start, stop, step), in radians
 
     betas: np.ndarray = None
+    toa_atol: float = 1e-3
+    phi_atol: float = np.deg2rad(0.05)
 
     max_iter: int = 100
     return_history: bool = False
 
     Mstep_maximizer: str = "gridsearch"
     Mstep_maxiter: int = 40
-    Mstep_toa_atol: float = 1e-3
 
     fdflen: int = 41  # length of fractional delay filter
     fdfwindow: str = "blackman"  # window for fractional delay filter
@@ -54,10 +53,11 @@ class EMMC_Estimate:
     tdoas: np.ndarray  # (M, R)
 
     def __init__(self, gains, toas, phis, setup: EMMC_Setup) -> None:
-        self.gains = gains
-        self.toas = toas
-        self.phis = phis
-        self.tdoas = compute_tdoas(phis, setup)
+        self.gains = np.array(gains)
+        self.toas = np.array(toas)
+        self.phis = np.array(phis)
+        assert len(self.gains) == len(self.toas) == len(self.phis)
+        self.tdoas = compute_tdoas(self.phis, setup)
 
     def sort_by_toas(self):
         sort_idx = np.argsort(self.toas)
@@ -89,6 +89,10 @@ class EMMC_Estimate:
 
     def __repr__(self) -> str:
         return self.__str__()
+    
+    @property
+    def num_ref(self):
+        return len(self.gains)
 
 
 # TODO: items in return_history don't necessarily need to be EMMC_estimate, best to have separate class... how to have class with optional/variable/on-the-fly attributes?
@@ -112,20 +116,80 @@ est = optimizer(J(toa, doa) for ...)
 
 """
 
+EchoEstimate = namedtuple('Echo', ['gain', 'toa', 'phi'])
+@dataclass
+class EchoEstimate:
+    gain: float
+    toa: float
+    phi: float
+
+    def equal(self, other: EchoEstimate, setup: EMMC_Setup):
+        return np.isclose(self.toa, other.toa, atol=setup.toa_atol) \
+            and np.isclose(self.phi, other.phi, atol=setup.phi_atol)
+    
+    def combine(self, other: EchoEstimate):
+        self.gain = self.gain + other.gain
+        self.toa = (self.toa + other.toa) / 2
+        self.phi = (self.phi + other.phi) /2
+
+    @classmethod
+    def random(cls, setup: EMMC_Setup) -> EchoEstimate:
+        cls.gain = np.random.uniform(0, 1.)
+        cls.toa = np.random.uniform(*setup.toa_range)
+        cls.phi = np.random.uniform(setup.phi_range[0], setup.phi_range[1])
+        return cls
+
+# TODO: I should have EchoEstimate class, store each estimate as list of estimates instead?
+def replace_dups(est: EMMC_Estimate, setup: EMMC_Setup) -> EMMC_Estimate:
+    echoes = (EchoEstimate(est.gains[i], est.toas[i], est.phis[i]) for i in range(est.num_ref))
+    new_echoes = [next(echoes)]
+    for e in echoes:
+        if e.equal(new_echoes[-1], setup):
+            new_echoes[-1].combine(e)
+        else:
+            new_echoes.append(e)
+
+    new_echoes += [EchoEstimate.random(setup) for i in range(est.num_ref - len(new_echoes))]
+    new_est = EMMC_Estimate(
+        gains=np.array([e.gain for e in new_echoes]),
+        toas=np.array([e.toa for e in new_echoes]),
+        phis=np.array([e.phi for e in new_echoes]),
+        setup=setup
+    )
+    new_est.
+    return new_est
+
+
+def EMMC(
+    src_signal, mic_signals, setup: EMMC_Setup, init_est: EMMC_Estimate
+) -> Generator[EMMC_Estimate, None, None]:
+    # exposes emmc, does other stuff like
+    # checking for convergence
+    # checking and addressing dupvals
+    emmc_gen = EMMC_simple(src_signal, mic_signals, setup, init_est)
+    for est in emmc_gen:
+        est = replace_dups(est)
+        yield est
 
 # TODO: rename to _EMMC cuz this is vanilla - no convergence checking, dupval, etc. Another encapsulant will do this
-def EMMC(
+def EMMC_simple(
     src_signal, mic_signals, setup: EMMC_Setup, init_est: EMMC_Estimate
 ) -> Generator[EMMC_Estimate, None, None]:
     assert (
         src_signal.shape[0] == mic_signals.shape[1]
     ), "Source and mic signals must have same length"
 
+    q = EstimateQueue(setup) # setup.atol's, setup.convergence_checker_window
     est_iter = copy.deepcopy(init_est)
     for i in range(setup.max_iter):  # TODO: maybe infinite loop?
         est_iter = EMMC_iter(src_signal, mic_signals, setup, est_iter)
-
+        est_iter = replace_dups(est_iter, setup)
+        q.add(est_iter)
+        if check_convergence(q):
+            break
         yield est_iter
+        # why are we sorting estimates anyway? 1. for dupval 2. when plotting/analysing history/checking for convergence of estimates, we need some 'continuity' in the estimates, i.e. the est-true reflection association should be consistent.
+        # if we aren't sorting, the non-duplicate values MUST remain in their same spot -> the dupval replacements must go in the same spot as the replaced values.
 
 
 def EMMC_iter(src_signal, mic_signals, setup: EMMC_Setup, cur_est: EMMC_Estimate):
@@ -163,18 +227,6 @@ def Mstep_r(xmr, src_signal, setup: EMMC_Setup):
 
         costfunc = lambda x: -M_func(*x, src_signal, xmr, setup)
 
-        # def M_costfunc(x):
-        # 	toa, phi = x
-        # 	tdoas = compute_tdoas(phi, setup)
-        # 	Dxmsum = np.zeros(len(src_signal))
-        # 	for m in range(setup.num_mics):
-        # 		Dxmsum += delay_signal(
-        # 			xmr[m], -tdoas[m], setup.fdflen, setup.fdfwindow
-        # 		)
-        # 	return -np.dot(
-        # 		Dxmsum, delay_signal(src_signal, toa, setup.fdflen, setup.fdfwindow)
-        # 	)
-
         delta_phi = setup.phi_range[2]
         res: OptimizeResult = minimize(
             costfunc,
@@ -186,21 +238,13 @@ def Mstep_r(xmr, src_signal, setup: EMMC_Setup):
             ),
             options={
                 "maxiter": setup.Mstep_maxiter,
-                "xatol": setup.Mstep_toa_atol,
-                # "bounds": Bounds(
-                #     lb=(grid_toa-1, grid_phi - delta_phi),
-                #     ub=(grid_toa+1, grid_phi + delta_phi)
-                # )
-                # "bounds": (
-                #     (grid_toa-1, grid_toa+1),
-                #     (grid_phi - delta_phi, grid_phi + delta_phi),
-				# )
+                "xatol": setup.toa_atol,
             },
         )
         if res.success:
             M_min = res.fun
             maxtoa, maxphi = res.x
-            print(f"Took {res.nit} iterations to minimize")
+            # print(f"Took {res.nit} iterations to minimize")
         else:
             print(f"Minimization failed, msg: {res.message}")
 
